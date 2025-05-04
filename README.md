@@ -1,81 +1,68 @@
 # NullifierDB
 
-A specialized database for storing and validating cryptographic nullifiers, particularly useful in zero-knowledge proof systems.
+A specialized database for storing and validating cryptographic nullifiers, optimized for zero-knowledge proof systems.
 
 ## Overview
 
-NullifierDB provides an efficient way to store and check membership of cryptographic nullifiers. It's designed to:
+NullifierDB provides a fast, reliable way to store and check cryptographic nullifiers:
 
-1. Store nullifiers as Curve25519 Scalar values
-2. Quickly verify if a nullifier has already been used (preventing double-spending)
-3. Persist data between sessions with automatic recovery
-4. Maintain data integrity
-
-## Technical Implementation
-
-- **Storage Format**: Nullifiers are stored as 32-byte values (Curve25519 Scalar)
-- **In-Memory Structure**: HashSet for O(1) lookups
-- **Persistence**: File-based storage with automatic recovery
-- **Error Handling**: Graceful handling of file corruption
+- Fast O(1) lookups with HashSet-based structure
+- Automatic persistence with durability guarantees 
+- Robust file corruption handling and repair
+- Exclusive file locking for multi-process safety
 
 ## API Reference
 
-### `NullifierDB::insert`
+### Creating and Opening
 
 ```rust
-pub fn insert(&mut self, scalar: Scalar) -> Option<bool>
+// Create new database
+let db = NullifierDB::create("/path/to/db")?;
+
+// Open existing database
+let db = NullifierDB::recover("/path/to/db")?;
 ```
 
-Inserts a new nullifier into the database.
-
-- **Parameters**:
-  - `scalar`: The Curve25519 Scalar value to insert
-- **Returns**:
-  - `Some(true)`: If the nullifier was new and successfully inserted
-  - `Some(false)`: If the nullifier already existed in the database
-  - `None`: If an error occurred during insertion
-
-### `NullifierDB::recover`
+### Core Operations
 
 ```rust
-pub fn recover(path: &Path) -> Option<NullifierDB>
+// Insert nullifier (returns true if new, false if already exists)
+let is_new = db.insert(nullifier)?;
+
+// Check if nullifier exists
+if db.contains(&nullifier) {
+    // Nullifier already used
+}
+
+// Get count of nullifiers
+let count = db.len();
+
+// Explicitly flush, sync and close
+db.flush_and_close()?;
 ```
 
-Recovers a NullifierDB from an existing file.
+## Implementation Details
 
-- **Parameters**:
-  - `path`: Path to the database file
-- **Returns**:
-  - `Some(NullifierDB)`: If recovery was successful
-  - `None`: If the file doesn't exist or is corrupted
+- **Storage**: 32-byte Curve25519 Scalar values in append-only file
+- **Memory**: HashSet for O(1) lookups
+- **Durability**: All inserts sync to disk by default
+- **Concurrency**: File-level locking prevents concurrent access
+- **Error Handling**: Comprehensive error types with context
 
-## Technical Notes
+## Performance Notes
 
-1. The database automatically handles file corruption by:
-   - Validating all loaded Scalar values
-   - Truncating files to valid 32-byte boundaries
-   - Positioning the writer at the end of the file for append operations
+- **Memory Usage**: O(n) - Scales linearly with number of nullifiers
+- **Lookup Speed**: O(1) HashSet operations (see benchmarks)
+- **Recovery Time**: O(n) - Linear with database size
+- **Insert Cost**: Hash computation + file append + sync
 
-2. The implementation uses a combination of:
-   - In-memory HashSet for fast lookups
-   - Sequential file writes for durability
-   - BufWriter for improved write performance
+## Common Use Cases
 
-3. Recovery process:
-   - Reads all nullifiers from the file
-   - Builds an in-memory HashSet
-   - Repairs file if necessary (truncating to valid 32-byte boundaries)
-   - Positions writer at the end for future appends
-
-## Use Cases
-
-Ideal for applications requiring cryptographic uniqueness guarantees, such as:
-
-- Zero-knowledge proof systems
-- Blockchain implementations (preventing double-spending)
-- Cryptocurrency mixers
-- Privacy-preserving authentication systems
+- ZK proof systems (nullifier verification)
+- Blockchain double-spend prevention
+- Cryptographic voting systems (one-time credential verification)
+- Privacy-preserving authentication
 
 ## Dependencies
 
-- curve25519-dalek (v4.1.3): For Scalar operations on the Curve25519 elliptic curve
+- curve25519-dalek: For Curve25519 Scalar operations

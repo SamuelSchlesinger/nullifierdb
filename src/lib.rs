@@ -5,6 +5,10 @@ use std::collections::HashSet;
 use std::fmt;
 use curve25519_dalek::Scalar;
 use log::{warn, debug};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 
 /// NullifierDB is a specialized database for storing cryptographic nullifiers.
 /// 
@@ -19,10 +23,8 @@ pub struct NullifierDB {
     writer: BufWriter<File>,
     /// In-memory set for fast lookups
     map: HashSet<Scalar>,
-    /// Path to the database file (used for locking)
+    /// Path to the database file
     db_path: std::path::PathBuf,
-    /// Path to the lock file (created during exclusive access)
-    lock_path: std::path::PathBuf,
     /// Flag to track if we own the lock
     lock_acquired: bool,
 }
@@ -94,20 +96,20 @@ pub enum NullifierError {
         path: String,
     },
     
-    /// Cannot create lock file
-    LockFileCreationError {
-        /// Path to the lock file
-        path: String,
+    /// Failed to acquire file lock
+    LockAcquisitionError {
         /// The underlying IO error
         source: io::Error,
+        /// Path to the database file
+        path: String,
     },
     
-    /// Failed to release lock
+    /// Failed to release file lock
     LockReleaseError {
-        /// Path to the lock file
-        path: String,
         /// The underlying IO error
         source: io::Error,
+        /// Path to the database file
+        path: String,
     },
 }
 
@@ -140,13 +142,13 @@ impl fmt::Display for NullifierError {
                 write!(f, "Failed to sync data to disk: {}", source),
                 
             Self::DatabaseLocked { path } => 
-                write!(f, "Database is already locked by another process at path: {}", path),
+                write!(f, "Database is locked at path: {}. Another process currently has exclusive access. If you're sure no other process is using the database, restart your application.", path),
                 
-            Self::LockFileCreationError { path, source } => 
-                write!(f, "Failed to create lock file at {}: {}", path, source),
+            Self::LockAcquisitionError { path, source } => 
+                write!(f, "Failed to acquire lock for database at {}: {}", path, source),
                 
             Self::LockReleaseError { path, source } => 
-                write!(f, "Failed to release lock file at {}: {}", path, source),
+                write!(f, "Failed to release lock for database at {}: {}", path, source),
         }
     }
 }
@@ -159,7 +161,7 @@ impl std::error::Error for NullifierError {
             Self::WriteError { source, .. } => Some(source),
             Self::FlushError { source } => Some(source),
             Self::SyncError { source } => Some(source),
-            Self::LockFileCreationError { source, .. } => Some(source),
+            Self::LockAcquisitionError { source, .. } => Some(source),
             Self::LockReleaseError { source, .. } => Some(source),
             _ => None,
         }
@@ -181,11 +183,113 @@ impl From<io::Error> for NullifierError {
 }
 
 impl NullifierDB {
+    /// Acquire a file lock using platform-specific functionality
+    /// This handles POSIX advisory locks on Unix and file locking on Windows
+    #[cfg(unix)]
+    fn acquire_file_lock(file: &File) -> io::Result<()> {
+        use libc::{flock, LOCK_EX, LOCK_NB};
+        
+        let fd = file.as_raw_fd();
+        
+        // LOCK_EX: exclusive lock
+        // LOCK_NB: non-blocking operation
+        let result = unsafe { flock(fd, LOCK_EX | LOCK_NB) };
+        
+        if result != 0 {
+            // Convert the C error to Rust io::Error
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Release a file lock using platform-specific functionality
+    #[cfg(unix)]
+    fn release_file_lock(file: &File) -> io::Result<()> {
+        use libc::{flock, LOCK_UN};
+        
+        let fd = file.as_raw_fd();
+        
+        // LOCK_UN: unlock the file
+        let result = unsafe { flock(fd, LOCK_UN) };
+        
+        if result != 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Acquire a file lock on Windows
+    #[cfg(windows)]
+    fn acquire_file_lock(file: &File) -> io::Result<()> {
+        use winapi::um::fileapi::LockFileEx;
+        use winapi::um::minwinbase::{OVERLAPPED, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY};
+        use winapi::shared::minwindef::DWORD;
+        
+        let handle = file.as_raw_handle();
+        
+        let mut overlapped = OVERLAPPED {
+            Internal: 0,
+            InternalHigh: 0,
+            Offset: 0,
+            OffsetHigh: 0,
+            hEvent: std::ptr::null_mut(),
+        };
+        
+        let result = unsafe {
+            LockFileEx(
+                handle,
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                !0 as DWORD,  // Lock the entire file (max size)
+                !0 as DWORD,  // Lock the entire file (max size)
+                &mut overlapped,
+            )
+        };
+        
+        if result == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Release a file lock on Windows
+    #[cfg(windows)]
+    fn release_file_lock(file: &File) -> io::Result<()> {
+        use winapi::um::fileapi::UnlockFileEx;
+        use winapi::um::minwinbase::OVERLAPPED;
+        use winapi::shared::minwindef::DWORD;
+        
+        let handle = file.as_raw_handle();
+        
+        let mut overlapped = OVERLAPPED {
+            Internal: 0,
+            InternalHigh: 0,
+            Offset: 0,
+            OffsetHigh: 0,
+            hEvent: std::ptr::null_mut(),
+        };
+        
+        let result = unsafe {
+            UnlockFileEx(
+                handle,
+                0,
+                !0 as DWORD,  // Unlock the entire file (max size)
+                !0 as DWORD,  // Unlock the entire file (max size)
+                &mut overlapped,
+            )
+        };
+        
+        if result == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
     /// Acquires an exclusive lock on the database
-    /// 
-    /// # Arguments
-    /// 
-    /// * `db_path` - Path to the database file
     /// 
     /// # Returns
     /// 
@@ -196,63 +300,30 @@ impl NullifierDB {
             return Ok(()); // Lock already acquired
         }
         
-        // Check if lock file already exists
-        if self.lock_path.exists() {
-            // Check if the lock file is stale (process that created it might have crashed)
-            // In a real production system, you'd want to check if the process ID in the lock file
-            // is still running, but for simplicity, we'll just check if the lock file is older than
-            // a certain threshold (e.g., 10 minutes)
-            match std::fs::metadata(&self.lock_path) {
-                Ok(metadata) => {
-                    if let Ok(modified_time) = metadata.modified() {
-                        if let Ok(age) = modified_time.elapsed() {
-                            // Check if lock is older than 10 minutes
-                            if age > std::time::Duration::from_secs(600) {
-                                // Lock file is stale, remove it
-                                if let Err(e) = std::fs::remove_file(&self.lock_path) {
-                                    return Err(NullifierError::Io {
-                                        source: e,
-                                        context: "removing stale lock file",
-                                    });
-                                }
-                                debug!("Removed stale lock file at {:?}", self.lock_path);
-                            } else {
-                                // Lock file exists and is not stale
-                                return Err(NullifierError::DatabaseLocked {
-                                    path: self.db_path.to_string_lossy().to_string(),
-                                });
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    return Err(NullifierError::Io {
+        // Try to acquire the lock on the database file
+        // This is atomic and avoids the TOCTOU race condition
+        let file = self.writer.get_mut();
+        
+        match Self::acquire_file_lock(file) {
+            Ok(()) => {
+                self.lock_acquired = true;
+                Ok(())
+            },
+            Err(e) => {
+                // If error is EWOULDBLOCK or equivalent, it means
+                // the file is already locked by another process
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    Err(NullifierError::DatabaseLocked {
+                        path: self.db_path.to_string_lossy().to_string(),
+                    })
+                } else {
+                    Err(NullifierError::LockAcquisitionError {
                         source: e,
-                        context: "checking lock file metadata",
-                    });
+                        path: self.db_path.to_string_lossy().to_string(),
+                    })
                 }
             }
         }
-        
-        // Create lock file
-        let mut lock_file = File::create(&self.lock_path).map_err(|e| {
-            NullifierError::LockFileCreationError {
-                path: self.lock_path.to_string_lossy().to_string(),
-                source: e,
-            }
-        })?;
-        
-        // Write process ID to lock file for debugging
-        use std::io::Write;
-        if let Err(e) = writeln!(lock_file, "{}", std::process::id()) {
-            return Err(NullifierError::Io {
-                source: e,
-                context: "writing process ID to lock file",
-            });
-        }
-        
-        self.lock_acquired = true;
-        Ok(())
     }
     
     /// Releases the exclusive lock on the database
@@ -266,16 +337,21 @@ impl NullifierDB {
             return Ok(()); // No lock to release
         }
         
-        // Remove lock file
-        std::fs::remove_file(&self.lock_path).map_err(|e| {
-            NullifierError::LockReleaseError {
-                path: self.lock_path.to_string_lossy().to_string(),
-                source: e,
-            }
-        })?;
+        // Release the lock
+        let file = self.writer.get_mut();
         
-        self.lock_acquired = false;
-        Ok(())
+        match Self::release_file_lock(file) {
+            Ok(()) => {
+                self.lock_acquired = false;
+                Ok(())
+            },
+            Err(e) => {
+                Err(NullifierError::LockReleaseError {
+                    source: e,
+                    path: self.db_path.to_string_lossy().to_string(),
+                })
+            }
+        }
     }
 
     /// Creates a new empty NullifierDB at the specified path.
@@ -300,9 +376,6 @@ impl NullifierDB {
     /// * `NullifierError::DatabaseLocked` - If the database is already locked by another process
     /// * `NullifierError::LockFileCreationError` - If the lock file cannot be created
     pub fn create(path: &Path) -> Result<NullifierDB, NullifierError> {
-        // First, prepare the lock path
-        let lock_path = path.with_extension("lock");
-        
         // Create a database instance but don't acquire the lock yet
         let mut db = NullifierDB {
             writer: BufWriter::new(File::create(path).map_err(|e| NullifierError::Io { 
@@ -311,11 +384,10 @@ impl NullifierDB {
             })?),
             map: HashSet::new(),
             db_path: path.to_path_buf(),
-            lock_path,
             lock_acquired: false,
         };
         
-        // Now acquire the lock
+        // Now acquire the lock on the file
         db.acquire_lock()?;
         
         Ok(db)
@@ -393,44 +465,50 @@ impl NullifierDB {
     /// * `NullifierError::DatabaseLocked` - If the database is already locked by another process
     /// * `NullifierError::LockFileCreationError` - If the lock file cannot be created
     pub fn recover(path: &Path) -> Result<NullifierDB, NullifierError> {
-        // Prepare lock path
-        let lock_path = path.with_extension("lock");
-        
-        // Create a temporary file path for the initial writer 
-        // We'll use a simple approach without external dependencies
-        let temp_path = std::env::temp_dir().join(format!("temp_nullifier_{}", std::process::id()));
-        let temp_file = File::create(&temp_path).map_err(|e| NullifierError::Io {
-            source: e,
-            context: "creating temporary file",
-        })?;
-        // Clean up the temporary file immediately after creating it
-        std::fs::remove_file(&temp_path).ok();
-        
+        // First, open the file for reading+writing
+        // We'll use this file handle for both locking and reading/writing
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| {
+                if e.kind() == ErrorKind::NotFound {
+                    NullifierError::FileNotFound { path: path.display().to_string() }
+                } else {
+                    NullifierError::Io { source: e, context: "opening database file for recovery" }
+                }
+            })?;
+            
         // Create a database instance but don't populate it yet
         let mut db = NullifierDB {
-            writer: BufWriter::new(temp_file),
+            writer: BufWriter::new(file),
             map: HashSet::new(),
             db_path: path.to_path_buf(),
-            lock_path,
             lock_acquired: false,
         };
         
         // Now acquire the lock before proceeding with recovery
         db.acquire_lock()?;
         
-        // Open the file for reading
-        let file = File::open(path).map_err(|e| {
+        // Get a reference to the underlying file, seeking to the beginning
+        {
+            let file_ref = db.writer.get_mut();
+            file_ref.seek(SeekFrom::Start(0)).map_err(|e| {
+                // Make sure to release the lock if we encounter an error
+                let _ = db.release_lock();
+                NullifierError::Io { source: e, context: "seeking to beginning of file" }
+            })?;
+        }
+        
+        // We need to recreate the reader from scratch to avoid borrow issues
+        // So we'll reopen the file for reading (we've already got the lock on it)
+        let read_file = File::open(path).map_err(|e| {
             // Make sure to release the lock if we encounter an error
             let _ = db.release_lock();
-            
-            if e.kind() == ErrorKind::NotFound {
-                NullifierError::FileNotFound { path: path.display().to_string() }
-            } else {
-                NullifierError::Io { source: e, context: "opening database file for reading" }
-            }
+            NullifierError::Io { source: e, context: "reopening database file for reading" }
         })?;
         
-        let mut reader = BufReader::new(file);
+        let mut reader = BufReader::new(read_file);
         let mut buffer = [0u8; 32];
         let mut position: u64 = 0;
         
@@ -470,21 +548,11 @@ impl NullifierDB {
             } 
         }
 
-        // Reopen the file for writing and potential repair
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(|e| {
-                // Release lock before returning error
-                let _ = db.release_lock();
-                NullifierError::Io { 
-                    source: e, 
-                    context: "reopening database file for writing" 
-                }
-            })?;
-            
-        let metadata = file.metadata()
+        // We need to get the file back from the reader to continue using it
+        // At this point, we've read all nullifiers successfully
+        
+        // Check if file size is valid (multiple of 32 bytes)
+        let metadata = db.writer.get_ref().metadata()
             .map_err(|e| {
                 // Release lock before returning error
                 let _ = db.release_lock();
@@ -510,7 +578,7 @@ impl NullifierDB {
             warn!("{}", corruption_error);
             
             // Truncate to the nearest valid boundary to repair corruption
-            if let Err(e) = file.set_len(valid_size) {
+            if let Err(e) = db.writer.get_mut().set_len(valid_size) {
                 // Release lock before returning error
                 let _ = db.release_lock();
                 return Err(NullifierError::TruncateError { 
@@ -521,7 +589,7 @@ impl NullifierDB {
         }
         
         // Position the writer at the end for appending
-        if let Err(e) = file.seek(SeekFrom::End(0)) {
+        if let Err(e) = db.writer.get_mut().seek(SeekFrom::End(0)) {
             // Release lock before returning error
             let _ = db.release_lock();
             return Err(NullifierError::Io { 
@@ -529,9 +597,6 @@ impl NullifierDB {
                 context: "positioning file writer at end of file" 
             });
         }
-
-        // Now replace the temporary writer with the real one
-        db.writer = BufWriter::new(file);
         
         // Return the reconstructed and locked NullifierDB
         Ok(db)
@@ -637,7 +702,7 @@ impl Drop for NullifierDB {
         if self.lock_acquired {
             if let Err(e) = self.release_lock() {
                 warn!("Failed to release NullifierDB lock during drop: {}", e);
-                warn!("LOCK FILE LEAK: Database lock file was not properly removed at: {:?}", self.lock_path);
+                warn!("LOCK FILE LEAK: Database lock file was not properly released for file: {:?}", self.db_path);
             } else if log::log_enabled!(log::Level::Debug) {
                 debug!("Successfully released NullifierDB lock during drop");
             }
@@ -723,6 +788,106 @@ mod tests {
         for nullifier in &nullifiers {
             assert!(recovered_db.contains(nullifier), 
                    "Expected nullifier to exist in the recovered database");
+        }
+        
+        Ok(())
+    }
+    
+    #[test]
+    fn test_empty_db_recovery() -> Result<(), NullifierError> {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let db_path = temp_dir.path().join("empty.db");
+        
+        // Create an empty database
+        {
+            let db = NullifierDB::create(&db_path)?;
+            // Immediately close without adding any nullifiers
+            db.flush_and_close()?;
+        }
+        
+        // Recover the empty database
+        let recovered_db = NullifierDB::recover(&db_path)?;
+        
+        // Verify it's empty
+        assert_eq!(recovered_db.len(), 0, "Recovered empty database should have zero nullifiers");
+        assert!(recovered_db.is_empty(), "Recovered empty database should be empty");
+        
+        Ok(())
+    }
+    
+    #[test]
+    fn test_lock_contention() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let db_path = temp_dir.path().join("locked.db");
+        
+        // First, create a database and hold it open
+        let db1 = NullifierDB::create(&db_path).expect("Failed to create first database");
+        
+        // Try to open the same database again while it's still locked
+        let result = NullifierDB::recover(&db_path);
+        
+        // Check that we get the expected DatabaseLocked error
+        match result {
+            Err(NullifierError::DatabaseLocked { path }) => {
+                assert_eq!(path, db_path.to_string_lossy().to_string(), 
+                         "Lock error should contain the correct path");
+                
+                // Verify the error message includes instructions
+                let error_msg = format!("{}", NullifierError::DatabaseLocked { path });
+                assert!(error_msg.contains("restart your application"), 
+                       "Error message should include recovery instructions");
+            },
+            Ok(_) => panic!("Expected DatabaseLocked error, got Ok"),
+            Err(e) => panic!("Expected DatabaseLocked error, got {:?}", e),
+        }
+        
+        // Close the first database
+        drop(db1); // Implicitly calls drop which should release the lock
+        
+        // Now we should be able to open it
+        let db2 = NullifierDB::recover(&db_path).expect("Failed to recover database after lock release");
+        
+        // Should be empty since we didn't add anything
+        assert!(db2.is_empty(), "Database should be empty");
+    }
+    
+    #[test]
+    fn test_zero_scalar_nullifier() -> Result<(), NullifierError> {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let db_path = temp_dir.path().join("zero_scalar.db");
+        
+        // Create zero scalar (identity element)
+        let zero_scalar = Scalar::ZERO;
+        
+        // Create database and insert zero scalar
+        {
+            let mut db = NullifierDB::create(&db_path)?;
+            
+            // Verify zero nullifier doesn't exist yet
+            assert!(!db.contains(&zero_scalar), "Zero scalar should not exist initially");
+            
+            // Insert zero scalar
+            let result = db.insert(zero_scalar)?;
+            assert!(result, "Expected insert to return true for zero scalar");
+            
+            // Check it was added
+            assert!(db.contains(&zero_scalar), "Expected zero scalar to exist after insertion");
+            
+            // Try to insert again
+            let result = db.insert(zero_scalar)?;
+            assert!(!result, "Expected insert to return false for duplicate zero scalar");
+            
+            // Manual close
+            db.flush_and_close()?;
+        }
+        
+        // Recover database and verify zero scalar persistence
+        {
+            let db = NullifierDB::recover(&db_path)?;
+            
+            // Check zero scalar was properly recovered
+            assert!(db.contains(&zero_scalar), "Zero scalar should persist after recovery");
+            assert_eq!(db.len(), 1, "Database should contain exactly one nullifier");
         }
         
         Ok(())

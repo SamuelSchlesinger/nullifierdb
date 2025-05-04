@@ -1,88 +1,66 @@
-# NullifierDB Design Document
+# NullifierDB Design
 
-## Overview
+## Design Goals
 
-NullifierDB is a specialized database designed for storing and validating cryptographic nullifiers. It is primarily intended for use in zero-knowledge proof systems, blockchain applications, and other cryptographic protocols where preventing double-spending or ensuring uniqueness is critical.
+1. **Performance**: Fast O(1) lookups for nullifier verification
+2. **Reliability**: Robust error handling and automatic recovery
+3. **Durability**: Data persistence with fsync guarantees
+4. **Simplicity**: Focused API for nullifier storage and verification
 
-## Core Design Principles
+## Architecture
 
-1. **Simplicity**: Focused on a single task - storing and checking nullifiers
-2. **Reliability**: Ensures data integrity with proper validation and error handling
-3. **Performance**: Optimized for fast lookups and append operations
-4. **Durability**: Ensures nullifiers are properly persisted before confirmation
+### Storage Model
 
-## Technical Architecture
+```
+┌─────────────────┐      ┌─────────────────┐
+│  In-Memory      │      │  Persistent     │
+│  HashSet<Scalar>│◄────►│  Storage File   │
+└─────────────────┘      └─────────────────┘
+     Fast lookups         Durability guarantees
+```
 
-### Data Structures
+- **Memory**: HashSet provides O(1) lookups
+- **Storage**: Append-only file with 32-byte scalar entries
+- **Concurrency**: File-level locking for multi-process safety
 
-1. **In-Memory Component**:
-   - Uses a `HashSet<Scalar>` for O(1) lookup performance
-   - Minimizes memory usage while providing fast access
+### Key Operations
 
-2. **Persistent Storage**:
-   - Simple append-only file format
-   - Each nullifier stored as a fixed-size 32-byte Scalar value
-   - No indexing or metadata overhead
+#### Insert
+1. Check HashSet for existence
+2. If new: append to file, flush buffers, sync to disk
+3. Return true/false indicating if nullifier was new
 
-### Operations
+#### Recovery
+1. Acquire file lock
+2. Read all nullifiers sequentially
+3. Validate each as canonical Curve25519 Scalar
+4. Add valid scalars to HashSet
+5. Repair file if needed (truncate to valid boundaries)
 
-1. **Insert Operation**:
-   - Check if nullifier exists in memory (HashSet)
-   - If new, append to file and flush to ensure durability
-   - Return status indicating whether nullifier was new
+## Performance Profile
 
-2. **Recovery Operation**:
-   - Read all nullifiers from file into memory
-   - Validate each nullifier as a canonical Curve25519 Scalar
-   - Repair file if necessary by truncating to valid 32-byte boundaries
-   - Position writer at end of file for future appends
+Operation | Complexity | Bottleneck
+----------|------------|----------
+Lookup    | O(1)       | HashSet operation (memory)
+Insert    | O(1)       | File sync (disk I/O)
+Recovery  | O(n)       | File read (disk I/O)
 
-### Error Handling
+## Error Handling Strategy
 
-- Uses `Option<T>` return types to gracefully handle errors
-- Validates cryptographic values to ensure database integrity
-- Attempts to repair corrupted files during recovery
+- **Comprehensive Error Types**: Detailed context for all failure modes
+- **Data Validation**: Verify scalars are canonical when loading
+- **Automatic Repair**: Truncate corrupted files to valid boundaries
+- **Leak Prevention**: Release locks on error or during drop
 
-## Performance Characteristics
+## Scalability Constraints
 
-### Time Complexity
-- Lookup: O(1) - HashSet-based in-memory lookups
-- Insert: O(1) - Single append operation to file
-- Recovery: O(n) - Linear scan of all nullifiers in the file
+- **Memory Usage**: All nullifiers must fit in memory
+- **Maximum Size**: Limited by available RAM
+- **Single Writer**: No concurrent write support
 
-### Space Complexity
-- Storage: O(n) - Each nullifier requires exactly 32 bytes on disk
-- Memory: O(n) - All nullifiers are loaded into memory for fast lookups
+## Future Optimizations
 
-## Scalability Considerations
-
-The current implementation has some scalability limitations:
-
-1. **Memory Usage**: All nullifiers are stored in memory, which could become problematic for very large datasets
-2. **No Sharding**: No built-in support for distributing data across multiple nodes
-3. **Single Writer**: No concurrent write optimizations
-
-For future versions, considerations might include:
-- Bloom filter pre-filtering for memory optimization
-- Memory-mapped files for improved performance on larger datasets
-- Potential B-tree or LSM-tree based storage for better scaling
-
-## Security Considerations
-
-1. **Data Integrity**: Validates all Scalar values to ensure they're canonical
-2. **File Corruption**: Handles and repairs file corruption when possible
-3. **No Authentication**: Current design does not include access controls or authentication mechanisms
-
-## Use Case Examples
-
-1. **ZK Proof System**:
-   - Store nullifiers to prevent double-spending in a privacy-preserving payment system
-   - Quickly verify a nullifier hasn't been used before
-
-2. **Blockchain Implementation**:
-   - Efficient storage and validation of transaction nullifiers
-   - Prevent replay attacks or double-spending
-
-3. **Cryptographic Voting System**:
-   - Ensure each voting credential is used only once
-   - Maintain voter privacy while preventing fraud
+1. **Memory Efficiency**: Bloom filter pre-filtering
+2. **I/O Performance**: Memory-mapped files, batched operations
+3. **Concurrency**: Fine-grained locking or lock-free algorithms
+4. **Distribution**: Sharding support for horizontal scaling
