@@ -3,12 +3,13 @@ use std::path::Path;
 use std::io::{self, BufReader, BufWriter, Read, Write, ErrorKind, SeekFrom, Seek};
 use std::collections::HashSet;
 use std::fmt;
-use curve25519_dalek::Scalar;
 use log::{warn, debug};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
+
+type Scalar = [u8; 32];
 
 /// NullifierDB is a specialized database for storing cryptographic nullifiers.
 /// 
@@ -415,7 +416,7 @@ impl NullifierDB {
     pub fn insert(&mut self, scalar: Scalar) -> Result<bool, NullifierError> {
         if self.map.insert(scalar) {
             // New nullifier: write to persistent storage
-            self.writer.write_all(scalar.as_bytes())
+            self.writer.write_all(&scalar)
                 .map_err(|err| NullifierError::WriteError { source: err, scalar })?;
             
             // Flush to ensure data is sent to OS
@@ -516,17 +517,7 @@ impl NullifierDB {
         loop {
             match reader.read_exact(&mut buffer) {
                 Ok(_) => {
-                    // Validate the bytes as a canonical Scalar
-                    if let Some(scalar) = Scalar::from_canonical_bytes(buffer).into() {
-                        db.map.insert(scalar);
-                    } else {
-                        // Invalid scalar data found - release lock before returning error
-                        let _ = db.release_lock();
-                        return Err(NullifierError::InvalidScalar { 
-                            position, 
-                            bytes: buffer 
-                        });
-                    }
+                    db.map.insert(buffer);
                     position += 32;
                 }
                 Err(e) => {
@@ -715,10 +706,13 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+    use rand::Fill;
 
     /// Helper function to create a random Scalar for testing
     fn random_scalar() -> Scalar {
-        Scalar::random(&mut rand::thread_rng())
+        let mut xs = [0u8; 32];
+        xs.try_fill(&mut rand::thread_rng());
+        xs
     }
 
     #[test]
@@ -857,7 +851,7 @@ mod tests {
         let db_path = temp_dir.path().join("zero_scalar.db");
         
         // Create zero scalar (identity element)
-        let zero_scalar = Scalar::ZERO;
+        let zero_scalar = [0u8; 32];
         
         // Create database and insert zero scalar
         {
@@ -955,40 +949,7 @@ mod tests {
         
         Ok(())
     }
-    
-    #[test]
-    fn test_invalid_scalar_error() {
-        let temp_dir = tempdir().expect("Failed to create temp dir");
-        let db_path = temp_dir.path().join("invalid_scalar.db");
-        
-        // Create an empty file first
-        std::fs::File::create(&db_path).expect("Failed to create file");
-        
-        // Write an invalid scalar (32 bytes of 0xFF, which exceeds the Ed25519 curve order)
-        {
-            let mut file = std::fs::OpenOptions::new().write(true).open(&db_path)
-                .expect("Failed to open file for writing invalid scalar");
-                
-            // Fill with 0xFF bytes which will create an invalid scalar
-            let invalid_scalar_bytes = [0xFF; 32];
-            file.write_all(&invalid_scalar_bytes)
-                .expect("Failed to write invalid scalar bytes");
-        }
-        
-        // Try to recover the database, which should fail with InvalidScalar error
-        let result = NullifierDB::recover(&db_path);
-        
-        // Check that we get an InvalidScalar error
-        match result {
-            Err(NullifierError::InvalidScalar { position, bytes }) => {
-                assert_eq!(position, 0, "Expected position to be 0");
-                assert_eq!(bytes, [0xFF; 32], "Expected bytes to match the invalid scalar");
-            },
-            Ok(_) => panic!("Expected InvalidScalar error, got Ok"),
-            Err(e) => panic!("Expected InvalidScalar error, got {:?}", e),
-        }
-    }
-    
+     
     #[test]
     fn test_sync_durability() -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = tempdir()?;
