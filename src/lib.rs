@@ -184,6 +184,11 @@ impl From<io::Error> for NullifierError {
 }
 
 impl NullifierDB {
+    /// Count the number of entries.
+    pub fn count(&self) -> usize {
+        self.map.len()
+    }
+
     /// Acquire a file lock using platform-specific functionality
     /// This handles POSIX advisory locks on Unix and file locking on Windows
     #[cfg(unix)]
