@@ -360,18 +360,19 @@ impl NullifierDB {
         }
     }
 
-    /// Creates a new empty NullifierDB at the specified path.
+    /// Creates a new NullifierDB at the specified path or recovers an existing one.
     ///
-    /// If the file already exists, it will be overwritten with an empty database.
+    /// If the file already exists, it will recover the database from the existing file.
+    /// If the file doesn't exist, it will create a new empty database.
     ///
     /// # Arguments
     ///
-    /// * `path` - Path where the database file should be created
+    /// * `path` - Path where the database file should be created or loaded from
     ///
     /// # Returns
     ///
-    /// * `Ok(NullifierDB)` - If creating the database was successful
-    /// * `Err(NullifierError)` - If an error occurred during creation
+    /// * `Ok(NullifierDB)` - If creating/recovering the database was successful
+    /// * `Err(NullifierError)` - If an error occurred during creation or recovery
     ///
     /// # Errors
     ///
@@ -381,8 +382,17 @@ impl NullifierDB {
     ///   non-existent parent directory, or other I/O errors
     /// * `NullifierError::DatabaseLocked` - If the database is already locked by another process
     /// * `NullifierError::LockFileCreationError` - If the lock file cannot be created
+    /// * `NullifierError::InvalidScalar` - If recovering an existing database and corrupt data is found
+    /// * `NullifierError::CorruptedFileSize` - If recovering a database with invalid file size
     pub fn create(path: &Path) -> Result<NullifierDB, NullifierError> {
-        // Create a database instance but don't acquire the lock yet
+        // Check if file already exists
+        if path.exists() {
+            // If it exists, try to recover it instead of overwriting
+            debug!("Database file already exists at {:?}, recovering instead of creating new", path);
+            return Self::recover(path);
+        }
+        
+        // Create a new database instance
         let mut db = NullifierDB {
             writer: BufWriter::new(File::create(path).map_err(|e| NullifierError::Io { 
                 source: e, 
@@ -804,8 +814,8 @@ mod tests {
             db.flush_and_close()?;
         }
         
-        // Recover the empty database
-        let recovered_db = NullifierDB::recover(&db_path)?;
+        // Use create on an existing database, which should recover it
+        let recovered_db = NullifierDB::create(&db_path)?;
         
         // Verify it's empty
         assert_eq!(recovered_db.len(), 0, "Recovered empty database should have zero nullifiers");
@@ -985,6 +995,69 @@ mod tests {
                 assert!(recovered_db.contains(nullifier), 
                        "Each nullifier should exist after sync");
             }
+        }
+        
+        Ok(())
+    }
+    
+    #[test]
+    fn test_create_recovers_existing_db() -> Result<(), NullifierError> {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let db_path = temp_dir.path().join("recovery_test.db");
+        
+        // Create initial nullifiers
+        let initial_nullifiers = vec![random_scalar(), random_scalar()];
+        
+        // Create database and add initial nullifiers
+        {
+            let mut db = NullifierDB::create(&db_path)?;
+            
+            for nullifier in &initial_nullifiers {
+                db.insert(*nullifier)?;
+            }
+            
+            db.flush_and_close()?;
+        }
+        
+        // Create additional nullifier to add after recovery
+        let additional_nullifier = random_scalar();
+        
+        // Use create() again on the existing database, which should recover it
+        {
+            let mut db = NullifierDB::create(&db_path)?;
+            
+            // Verify all initial nullifiers were recovered
+            assert_eq!(db.len(), initial_nullifiers.len(), 
+                      "Database should contain all initial nullifiers after recovery");
+            
+            for nullifier in &initial_nullifiers {
+                assert!(db.contains(nullifier), 
+                       "Each initial nullifier should exist after recovery");
+            }
+            
+            // Add one more nullifier
+            db.insert(additional_nullifier)?;
+            
+            db.flush_and_close()?;
+        }
+        
+        // Reopen one more time to verify all nullifiers are present
+        {
+            let db = NullifierDB::recover(&db_path)?;
+            
+            // Verify we have all nullifiers (initial + additional)
+            assert_eq!(db.len(), initial_nullifiers.len() + 1, 
+                      "Database should contain all nullifiers");
+            
+            // Check initial nullifiers still exist
+            for nullifier in &initial_nullifiers {
+                assert!(db.contains(nullifier), 
+                       "Initial nullifier should still exist");
+            }
+            
+            // Check additional nullifier exists
+            assert!(db.contains(&additional_nullifier), 
+                   "Additional nullifier should exist");
         }
         
         Ok(())
