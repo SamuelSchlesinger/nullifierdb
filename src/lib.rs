@@ -431,18 +431,36 @@ impl NullifierDB {
     pub fn insert(&mut self, scalar: Scalar) -> Result<bool, NullifierError> {
         if self.map.insert(scalar) {
             // New nullifier: write to persistent storage
-            self.writer.write_all(&scalar)
-                .map_err(|err| NullifierError::WriteError { source: err, scalar })?;
-            
+            let write_result = self.writer.write_all(&scalar)
+                .map_err(|err| NullifierError::WriteError { source: err, scalar });
+
+            if let Err(e) = write_result {
+                // Rollback: remove from memory since disk write failed
+                self.map.remove(&scalar);
+                return Err(e);
+            }
+
             // Flush to ensure data is sent to OS
-            self.writer.flush()
-                .map_err(|err| NullifierError::FlushError { source: err })?;
+            let flush_result = self.writer.flush()
+                .map_err(|err| NullifierError::FlushError { source: err });
+
+            if let Err(e) = flush_result {
+                // Rollback: remove from memory since flush failed
+                self.map.remove(&scalar);
+                return Err(e);
+            }
 
             // Sync to ensure OS syncs data to disk
             let file = self.writer.get_mut();
-            file.sync_all()
-                .map_err(|err| NullifierError::SyncError { source: err })?;
-            
+            let sync_result = file.sync_all()
+                .map_err(|err| NullifierError::SyncError { source: err });
+
+            if let Err(e) = sync_result {
+                // Rollback: remove from memory since sync failed
+                self.map.remove(&scalar);
+                return Err(e);
+            }
+
             Ok(true)
         } else {
             // Nullifier already exists
