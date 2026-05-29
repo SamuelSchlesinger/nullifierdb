@@ -473,10 +473,11 @@ impl NullifierDB {
     /// This method:
     /// 1. Acquires an exclusive lock on the database
     /// 2. Reads all nullifiers from the file
-    /// 3. Validates each nullifier as a canonical Curve25519 Scalar
-    /// 4. Builds an in-memory HashSet for fast lookups
-    /// 5. Repairs the file if necessary (truncating to valid 32-byte boundaries)
-    /// 6. Positions the writer at the end for future appends
+    /// 3. Loads each 32-byte entry as-is into an in-memory HashSet (no canonical
+    ///    Curve25519 scalar validation is performed — callers are responsible for
+    ///    supplying valid scalars before inserting them)
+    /// 4. Repairs the file if necessary (truncating to valid 32-byte boundaries)
+    /// 5. Positions the writer at the end for future appends
     ///
     /// # Arguments
     ///

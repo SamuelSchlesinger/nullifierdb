@@ -33,9 +33,10 @@
 #### Recovery
 1. Acquire file lock
 2. Read all nullifiers sequentially
-3. Validate each as canonical Curve25519 Scalar
-4. Add valid scalars to HashSet
-5. Repair file if needed (truncate to valid boundaries)
+3. Load each 32-byte entry as-is into the HashSet (no canonical Curve25519
+   scalar validation is performed — callers are responsible for supplying
+   valid scalars before inserting them)
+4. Repair file if needed (truncate to valid boundaries)
 
 ## Performance Profile
 
@@ -48,7 +49,7 @@ Recovery  | O(n)       | File read (disk I/O)
 ## Error Handling Strategy
 
 - **Comprehensive Error Types**: Detailed context for all failure modes
-- **Data Validation**: Verify scalars are canonical when loading
+- **File Integrity**: Verify file size is a multiple of 32 bytes; truncate to valid boundary if not (no canonical scalar validation is performed)
 - **Automatic Repair**: Truncate corrupted files to valid boundaries
 - **Leak Prevention**: Release locks on error or during drop
 
